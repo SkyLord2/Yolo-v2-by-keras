@@ -5,27 +5,35 @@
 # @Email: chengdongsheng@outlook.com
 # @File : YOLOv2.py
 # @Software: PyCharm
+import sys
 import tensorflow as tf
 import tensorflow.keras as keras
 import tensorflow.keras.backend as K
+import config as cfg
 from tensorflow.keras.layers import Lambda, Conv2D, BatchNormalization, LeakyReLU, MaxPool2D, Input, GlobalAveragePooling2D, Softmax, concatenate
 from tensorflow.keras.models import Model
 import numpy as np
 
 class YOLOv2:
-    def __init__(self, alpha = 0.1, anchors = None, classes = None, input_size = 416,  model_path = None, lambda_noobj = None, lambda_prior = None, lambda_coord = None, lambda_obj = None, lambda_class = None):
+    def __init__(self, alpha = 0.1, model_path = None):
         self.alpha = alpha
-        self.lambda_noobj = lambda_noobj
-        self.lambda_prior = lambda_prior
-        self.lambda_coord = lambda_coord
-        self.lambda_obj = lambda_obj
-        self.lambda_class = lambda_class
-        self.anchors = anchors
-        self.num_anchor = len(anchors)
-        self.classes = classes
-        self.num_classes = len(classes)
-        self.input_size = input_size
-        self.model = self.build(input_size, self.num_classes, self.num_anchor, self.alpha)
+        self.model_path = model_path
+        self.batch_size = cfg.BATCH_SIZE
+        self.epochs = cfg.EPOCHS
+        self.learning_rate = cfg.LEARNING_RATE
+        self.momentum = cfg.MOMENTUM
+        self.lambda_noobj = cfg.NOOBJECT_SCALE
+        self.lambda_coord = cfg.COORD_SCALE
+        self.lambda_obj = cfg.OBJECT_SCALE
+        self.lambda_class = cfg.CLASS_SCALE
+        self.anchors = cfg.YOLO_ANCHORS
+        self.num_anchor = len(self.anchors)
+        self.classes = cfg.CLASSES
+        self.num_classes = len(self.classes)
+        self.input_size = cfg.IMAGE_SIZE
+        self.conv_index = self.generateOffsetGrid([self.input_size // 32, self.input_size // 32], tf.float32)
+        self.model = self.build(self.input_size, self.num_classes, self.num_anchor, self.alpha)
+
     def build(self, input_size, num_classe, num_anchor = 5, alpha = 0.1):
         """
         构建DarkNet-19
@@ -178,9 +186,9 @@ class YOLOv2:
         :param model: 学习模型
         :return: None
         """
-        optimizer = keras.optimizers.SGD(learning_rate=self.learning_rate, momentum=self.momentum)
+        optimizer = keras.optimizers.SGD(learning_rate=self.learning_rate, momentum=self.momentum, clipnorm=1.)
         # 网络的损失已经在网络的最后一层进行计算，网络的输出已经是损失
-        self.model.compile(optimizer = optimizer, loss = {"yolo_loss": lambda y_true, y_pred: y_pred}, metrics=['accuracy'])
+        self.model.compile(optimizer = optimizer, loss = {"yolo_loss": lambda y_true, y_pred: y_pred}, metrics=['mse'])
 
     # YOLO_ANCHORS = np.array(((0.57273, 0.677385), (1.87446, 2.06253), (3.33843, 5.47434),(7.88282, 3.52778), (9.77052, 9.16828)))
     # anchors_value = np.array([[1.08, 1.19], [3.42, 4.41], [6.63, 11.38], [9.42, 5.11], [16.62, 10.52]], dtype='float32')
@@ -193,20 +201,32 @@ class YOLOv2:
         """
         if(learning_scheduler is None):
             def lr_scheduler(epoch):
-                lr = 1e-4
-                if(epoch <= 75):
-                    lr = 1e-2
-                elif(75 < epoch and epoch <= 105):
+                lr = 1e-3
+                if (epoch <= 60):
                     lr = 1e-3
-                elif(105 < epoch and epoch <= 135):
+                elif (60 < epoch and epoch <= 90):
                     lr = 1e-4
+                elif (90 < epoch and epoch <= 135):
+                    lr = 1e-5
                 return lr
             learning_scheduler = lr_scheduler
         lr_schedule = tf.keras.callbacks.LearningRateScheduler(learning_scheduler)
         history = self.model.fit(data, labels, batch_size=self.batch_size, epochs=self.epochs, callbacks=[lr_schedule])
         return history
-    def train_generator(self, generator, step_per_epoch, epochs, callbacks=None):
-        self.model.fit_generator(generator, steps_per_epoch=step_per_epoch, epochs=epochs, callbacks=callbacks)
+    def train_generator(self, generator, data_size, callbacks=None):
+        if(callbacks is None):
+            def lr_scheduler(epoch):
+                lr = 1e-3
+                if (epoch <= 60):
+                    lr = 1e-3
+                elif (60 < epoch and epoch <= 90):
+                    lr = 1e-4
+                elif (90 < epoch and epoch <= 135):
+                    lr = 1e-5
+                return lr
+            lr_schedule = tf.keras.callbacks.LearningRateScheduler(lr_scheduler)
+            callbacks = [lr_schedule]
+        self.model.fit_generator(generator(), steps_per_epoch=data_size//self.batch_size, epochs=self.epochs, callbacks=callbacks)
 
     def model_summary(self):
         self.model.summary()
@@ -221,6 +241,26 @@ class YOLOv2:
 
     def model_load(self, path):
         self.model.load_weights(path)
+
+    def generateOffsetGrid(self, conv_dim, dtype):
+        """
+        生成网格的偏执
+        :param conv_dim: x,y方向的网格数量
+        :param dtype: 数据类型
+        :return: conv_index
+        """
+        conv_height_index = tf.reshape(np.arange(start=0, stop=conv_dim[0]), (conv_dim[0],),
+                                       name="generateOffsetGrid_reshape_conv_height_index")
+        conv_width_index = tf.reshape(np.arange(start=0, stop=conv_dim[1]), (conv_dim[1],),
+                                      name="generateOffsetGrid_reshape_conv_width_index")
+
+        conv_height_index = tf.tile(conv_height_index, [conv_dim[1]])
+        conv_width_index = tf.tile(tf.expand_dims(conv_width_index, 0), [conv_dim[0], 1])
+        conv_width_index = K.flatten(tf.transpose(conv_width_index))
+        conv_index = tf.transpose(tf.stack([conv_height_index, conv_width_index]))
+        conv_index = tf.reshape(conv_index, (1, conv_dim[0], conv_dim[1], 1, 2), name="generateOffsetGrid_reshape_conv_index")
+        conv_index = tf.cast(conv_index, dtype, name="generateOffsetGrid_cast_conv_index")
+        return conv_index
 
     def preprocess_net_output(self, output, anchors, num_classes):
         """
@@ -238,15 +278,7 @@ class YOLOv2:
         anchors_tensor = tf.reshape(tf.cast(anchors, output.dtype, name="preprocess_cast_anchord"), (1, 1, 1, num_anchors, 2), name="preprocess_reshape_anchors")
         conv_dim = output.shape[1:3]
 
-        conv_height_index = tf.reshape(np.arange(start=0, stop=conv_dim[0]),(conv_dim[0],), name="preprocess_reshape_conv_height_index")
-        conv_width_index = tf.reshape(np.arange(start=0, stop=conv_dim[1]),(conv_dim[1],), name="preprocess_reshape_conv_width_index")
-
-        conv_height_index = tf.tile(conv_height_index, [conv_dim[1]])
-        conv_width_index = tf.tile(tf.expand_dims(conv_width_index, 0), [conv_dim[0], 1])
-        conv_width_index = K.flatten(tf.transpose(conv_width_index))
-        conv_index = tf.transpose(tf.stack([conv_height_index, conv_width_index]))
-        conv_index = tf.reshape(conv_index, (1, conv_dim[0], conv_dim[1], 1, 2), name="preprocess_reshape_conv_index")
-        conv_index = tf.cast(conv_index, output.dtype, name="preprocess_cast_conv_index")
+        conv_index = self.conv_index
         # [batch_size, 13, 13, 125] -> [batch_size, 13, 13, 5, 25]
         output = tf.reshape(output, (-1, conv_dim[0], conv_dim[1], num_anchors, num_classes + 5), name="preprocess_reshape_output")
         conv_dim = tf.cast(tf.reshape(conv_dim, (1,1,1,1,2), name="preprocess_reshape_conv_dim"), output.dtype, name="preprocess_cast_conv_dim")
@@ -255,11 +287,37 @@ class YOLOv2:
         box_wh = tf.exp(output[..., 2:4])
         box_conf = tf.sigmoid(output[..., 4:5])
         box_cls = tf.nn.softmax(output[..., 5:])
-
+        # 除以conv_dim，进行归一化
         box_xy = (box_xy + conv_index)/conv_dim
         box_wh = (anchors_tensor * box_wh)/conv_dim
 
         return box_xy, box_wh, box_conf, box_cls
+
+    def preprocess_gt_boxes(self, gt_boxes, anchors):
+        """
+        对gt_boxes进行预处理
+        :param gt_boxes:
+        :param anchors:
+        :return:
+        """
+        num_anchors = len(anchors)
+        anchors_tensor = tf.reshape(tf.cast(anchors, gt_boxes.dtype, name="preprocess_gt_boxes_cast_anchord"),
+                                    (1, 1, 1, num_anchors, 2), name="preprocess_gt_boxes_reshape_anchors")
+        conv_dim = gt_boxes.shape[1:3]
+
+        conv_index = self.conv_index
+
+        conv_dim = tf.cast(tf.reshape(conv_dim, (1, 1, 1, 1, 2), name="preprocess_gt_boxes_reshape_conv_dim"), gt_boxes.dtype,
+                           name="preprocess_gt_boxes_cast_conv_dim")
+        # 缩放到[0, 1]
+        box_xy = tf.sigmoid(gt_boxes[..., :2])
+        box_wh = tf.exp(gt_boxes[..., 2:4])
+        box_cls = tf.nn.softmax(gt_boxes[..., 4:])
+        # 加上偏执，除以conv_dim，进行归一化
+        box_xy = (box_xy + conv_index) / conv_dim
+        box_wh = (anchors_tensor * box_wh) / conv_dim
+
+        return box_xy, box_wh, box_cls
     def loss(self, args, anchors, num_classes):
         """
         计算损失
@@ -275,10 +333,10 @@ class YOLOv2:
         num_anchors = len(anchors)
 
         # 各个损失的权重
-        obj_scale = 5
-        no_obj_scal = 1
-        class_scale = 1
-        coord_scale = 1
+        obj_scale = self.lambda_obj
+        no_obj_scal = self.lambda_noobj
+        class_scale = self.lambda_class
+        coord_scale = self.lambda_coord
         # pred_xy:[batch_size, 13, 13, 5, 2]
         # pred_wh:[batch_size, 13, 13, 5, 2]
         # pred_conf:[batch_size, 13, 13, 5, 1]
@@ -316,8 +374,7 @@ class YOLOv2:
 
         # shape (batch_szie, 13, 13, 5, 2)
         # batch_szie, height, width, num_anchors, (x,y,w,h,c)
-        gt_xy = gt_boxes[..., 0:2]
-        gt_wh = gt_boxes[..., 2:4]
+        gt_xy, gt_wh, gt_cls = self.preprocess_gt_boxes(gt_boxes, anchors)
         gt_wh_self = gt_wh/2
         # 左上右下角的坐标
         # shape (batch_szie, 13, 13, 5, 2)
@@ -381,17 +438,19 @@ class YOLOv2:
         IV计算预测类别损失
         """
         # shape (batch_size, 13, 13, 5)
-        true_cls = tf.cast(gt_boxes[..., 4], tf.float32, name="loss_cast_class")
+        true_cls = gt_boxes[..., 4]
         # shape (batch_size, 13, 13, 5, 20)
-        true_cls - tf.one_hot(tf.cast(true_cls, tf.int32), num_classes)
-        class_loss = class_scale * response_anchor * tf.square(pred_cls - true_cls)
+        true_class = tf.one_hot(tf.cast(true_cls, tf.int32), num_classes)
+        # shape (batch_size, 13, 13, 5, 20)
+        class_loss = class_scale * response_anchor * tf.square(pred_cls - true_class)
         """
         V计算总体损失
         """
-        conf_loss_sum = tf.reduce_sum(conf_loss)
-        coord_loss_sum = tf.reduce_sum(coord_loss)
-        class_loss_sum = tf.reduce_sum(class_loss)
+        conf_loss_sum = tf.reduce_sum(conf_loss, axis=[1,2,3,4])
+        coord_loss_sum = tf.reduce_sum(coord_loss, axis=[1,2,3,4])
+        class_loss_sum = tf.reduce_sum(class_loss, axis=[1,2,3,4])
 
         total_loss = 0.5 * (conf_loss_sum + coord_loss_sum + class_loss_sum)
-
+        total_loss = tf.reduce_sum(total_loss, keepdims=True)
+        tf.print("total_loss", total_loss, output_stream=sys.stderr)
         return total_loss
