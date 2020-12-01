@@ -33,6 +33,9 @@ class YOLOv2:
         self.input_size = cfg.IMAGE_SIZE
         self.conv_index = self.generateOffsetGrid([self.input_size // 32, self.input_size // 32], tf.float32)
         self.model = self.build(self.input_size, self.num_classes, self.num_anchor, self.alpha)
+        # 加载权重
+        if(model_path is not None):
+            self.model_load(model_path)
 
     def build(self, input_size, num_classe, num_anchor = 5, alpha = 0.1):
         """
@@ -264,7 +267,7 @@ class YOLOv2:
 
     def preprocess_net_output(self, output, anchors, num_classes):
         """
-        转换网络最后一层（不包括损失计算层）的输出[batch_size，height_scale, width_scale, num_anchors, num_classes+5]
+        转换网络最后一层（不包括损失计算层）的输出[batch_size，height_scale, width_scale, num_anchors, num_classes+5]，还原到正常的坐标宽高
         :param output: 网络最后一层的输出，不包括损失计算层
         :param anchors: 每个grid cell采用5个anchor，[[w,h]]，w，h是与grid cell尺寸的比值
         :param num_classes: 类别数量
@@ -282,20 +285,22 @@ class YOLOv2:
         # [batch_size, 13, 13, 125] -> [batch_size, 13, 13, 5, 25]
         output = tf.reshape(output, (-1, conv_dim[0], conv_dim[1], num_anchors, num_classes + 5), name="preprocess_reshape_output")
         conv_dim = tf.cast(tf.reshape(conv_dim, (1,1,1,1,2), name="preprocess_reshape_conv_dim"), output.dtype, name="preprocess_cast_conv_dim")
-        # 缩放到[0, 1]
+        # 使用sigmoid缩放到[0, 1]，是因维中心坐标只能在grid cell之内
+        # (y,x,h,w)
         box_xy = tf.sigmoid(output[..., :2])
         box_wh = tf.exp(output[..., 2:4])
         box_conf = tf.sigmoid(output[..., 4:5])
         box_cls = tf.nn.softmax(output[..., 5:])
-        # 除以conv_dim，进行归一化
+        # 加上grid cell的偏置，除以conv_dim，进行归一化
         box_xy = (box_xy + conv_index)/conv_dim
+        # 论文的公式
         box_wh = (anchors_tensor * box_wh)/conv_dim
 
         return box_xy, box_wh, box_conf, box_cls
 
     def preprocess_gt_boxes(self, gt_boxes, anchors):
         """
-        对gt_boxes进行预处理
+        对gt_boxes进行预处理，还原到正常的坐标宽高
         :param gt_boxes:
         :param anchors:
         :return:
@@ -309,11 +314,11 @@ class YOLOv2:
 
         conv_dim = tf.cast(tf.reshape(conv_dim, (1, 1, 1, 1, 2), name="preprocess_gt_boxes_reshape_conv_dim"), gt_boxes.dtype,
                            name="preprocess_gt_boxes_cast_conv_dim")
-        # 缩放到[0, 1]
-        box_xy = tf.sigmoid(gt_boxes[..., :2])
+        # (y,x,h,w)
+        box_xy = gt_boxes[..., :2]
         box_wh = tf.exp(gt_boxes[..., 2:4])
-        box_cls = tf.nn.softmax(gt_boxes[..., 4:])
-        # 加上偏执，除以conv_dim，进行归一化
+        box_cls = gt_boxes[..., 4:]
+        # 加上grid cell偏置，除以conv_dim，进行归一化
         box_xy = (box_xy + conv_index) / conv_dim
         box_wh = (anchors_tensor * box_wh) / conv_dim
 
@@ -321,8 +326,8 @@ class YOLOv2:
     def loss(self, args, anchors, num_classes):
         """
         计算损失
-        :param args:    yolo_out:网络输出(batch_size, 13, 13, 5* (5+num_classes))
-                        gt_boxes:真实边界框(batch_size, 13, 13, 5, 5)
+        :param args:    yolo_out:网络输出(batch_size, 13, 13, 5* (5+num_classes)), 归一化之后的值
+                        gt_boxes:真实边界框(batch_size, 13, 13, 5, 5) (y,x,h,w)， 归一化之后的值
                         response_anchor: 用来负责预测的anchor，0/1 负责预测/不负责不预测, 形如（batch_size, 13，13，5，1）
                         matching_true_boxes：anchor对于gt box的偏移（相对于grid cell）以及目标类别，形如（batch_size, 13，13，5，5）
         :param anchors: 一组（5个）先验anchor的尺寸
@@ -362,8 +367,8 @@ class YOLOv2:
         pred_rd = pred_xy + pred_wh_half
         # 宽度与高度
         # shape(batch_size, 13, 13, 5)
-        pred_w = pred_wh[..., 0]
-        pred_h = pred_wh[..., 1]
+        pred_h = pred_wh[..., 0]
+        pred_w = pred_wh[..., 1]
         # 恢复形状
         # shape(batch_size, 13, 13, 5, 1)
         pred_w = tf.expand_dims(pred_w, axis=-1)
@@ -379,11 +384,11 @@ class YOLOv2:
         # 左上右下角的坐标
         # shape (batch_szie, 13, 13, 5, 2)
         gt_lu = gt_xy - gt_wh_self
-        gt_rd = gt_xy - gt_wh_self
+        gt_rd = gt_xy + gt_wh_self
         # 宽度与高度
         # shape (batch_szie, 13, 13, 5)
-        gt_w = gt_wh[..., 0]
-        gt_h = gt_wh[..., 1]
+        gt_h = gt_wh[..., 0]
+        gt_w = gt_wh[..., 1]
         # 恢复维度
         # shape (batch_szie, 13, 13, 5, 1)
         gt_w = tf.expand_dims(gt_w, axis=-1)
@@ -398,8 +403,8 @@ class YOLOv2:
         inter_wh = tf.maximum(inter_max - inter_min, 0.)
         # 交叉区域的宽度与高度
         # shape (batch_size, 13, 13, 5)
-        inter_w = inter_wh[..., 0]
-        inter_h = inter_wh[..., 1]
+        inter_h = inter_wh[..., 0]
+        inter_w = inter_wh[..., 1]
         # 恢复维度
         # shape(batch_size, 13, 13, 5, 1)
         inter_w = tf.expand_dims(inter_w, axis=-1)

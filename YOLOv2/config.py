@@ -35,7 +35,7 @@ CLASSES = ['aeroplane',
            'train',
            'tvmonitor']
 
-FLIPPED = True
+FLIPPED = False
 
 """
 model parameter

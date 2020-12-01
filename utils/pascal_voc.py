@@ -72,7 +72,6 @@ class pascal_voc(object):
         :param size:
         :return:
         """
-        print("total size: ", len(self.gt_labels))
         images = np.zeros(
             (size, self.image_size, self.image_size, 3))
         labels = np.zeros(
@@ -92,7 +91,7 @@ class pascal_voc(object):
                 np.random.shuffle(self.gt_labels)  # 随机打乱gt_labels
                 self.cursor = 0
                 self.epoch += 1  # epoch加1
-        return images, labels, response_anchors  # 返回size大小的图片和对应的label，注意其shape
+        return imname, images, labels, response_anchors  # 返回size大小的图片和对应的label，注意其shape
 
     def image_read(self, imname, flipped=False):
         """
@@ -104,7 +103,7 @@ class pascal_voc(object):
         image = cv2.imread(imname)
         image = cv2.resize(image, (self.image_size, self.image_size))  # resize大小为416
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB).astype(np.float32)
-        image = (image / 255.0) * 2.0 - 1.0
+        image = (image / 255.0)
         if flipped:
             image = image[:, ::-1, :]  # 反转图片
         return image
@@ -210,11 +209,9 @@ class pascal_voc(object):
             x_center = (x2 + x1) / 2.0
             w = x2 - x1
             h = y2 - y1
-            y_ind = np.floor(y_center).astype(
-                'int')  # 查看object的y_center落在哪个cell, 整张图片cell的数量为(image_size//32)*(image_size//32)
-            x_ind = np.floor(x_center).astype(
-                'int')  # 查看object的x_center落在哪个cell，整张图片cell的数量为(image_size//32)*(image_size//32)
-            box = np.array([y_center, x_center, w, h])
+            y_ind = np.floor(y_center).astype('int')  # y_center落在哪个cell, cell的数量为13*13
+            x_ind = np.floor(x_center).astype('int')  # x_center落在哪个cell
+            box = np.array([y_center, x_center, h, w]) # 排列的方式为(y, x, h, w),loss函数中计算交并比时要注意
             best_iou = 0.
             best_anchor = 0
 
@@ -238,10 +235,10 @@ class pascal_voc(object):
             if (best_iou > 0):
                 reponse_anchors[y_ind, x_ind, best_anchor] = 1
                 adjust_box = np.array([
-                    box[0] - y_ind,
-                    box[1] - x_ind,
-                    np.log(box[2] / self.anchors[best_anchor][0]),
-                    np.log(box[3] / self.anchors[best_anchor][1]),
+                    box[0] - y_ind, # y
+                    box[1] - x_ind, # x
+                    np.log(box[2] / self.anchors[best_anchor][0]),  # h
+                    np.log(box[3] / self.anchors[best_anchor][1]),  # w
                     cls_ind], dtype=np.float32)
                 label[y_ind, x_ind, best_anchor] = adjust_box
         return label, reponse_anchors, len(objs)
