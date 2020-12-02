@@ -78,9 +78,11 @@ class pascal_voc(object):
             (size, self.cell_size, self.cell_size, self.num_anchors, 5))
         response_anchors = np.zeros(
             (size, self.cell_size, self.cell_size, self.num_anchors, 1))
+        imnames = []
         count = 0
         while count < size:
             imname = self.gt_labels[self.cursor]['imname']
+            imnames.append(imname)
             flipped = self.gt_labels[self.cursor]['flipped']
             images[count, :, :, :] = self.image_read(imname, flipped)  # 读取图片
             labels[count, :, :, :, :] = self.gt_labels[self.cursor]['label']  # 图片的label
@@ -91,7 +93,7 @@ class pascal_voc(object):
                 np.random.shuffle(self.gt_labels)  # 随机打乱gt_labels
                 self.cursor = 0
                 self.epoch += 1  # epoch加1
-        return imname, images, labels, response_anchors  # 返回size大小的图片和对应的label，注意其shape
+        return imnames, images, labels, response_anchors  # 返回size大小的图片和对应的label，注意其shape
 
     def image_read(self, imname, flipped=False):
         """
