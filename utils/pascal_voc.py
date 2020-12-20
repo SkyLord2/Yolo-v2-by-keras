@@ -33,6 +33,7 @@ class pascal_voc(object):
         self.devkil_path = os.path.join(cfg.PASCAL_PATH, 'VOCdevkit')  # data/pascal_voc/VOCdevkit(数据集的根目录，包含不同年份的数据)
         self.data_path = os.path.join(self.devkil_path, 'VOC2007')  # data/pascal_voc/VOCdevkit/VOC2007
         print("file path=", os.path.abspath(__file__))
+        self.max_boxes_num = 42                                     # voc 2007中一张图片最多有42个bounding box
         self.cache_path = cfg.CACHE_PATH  # data/pascal_voc/cache
         self.batch_size = cfg.BATCH_SIZE  # batch size 为 64
         self.image_size = cfg.IMAGE_SIZE  # image_size为 448*448
@@ -73,27 +74,28 @@ class pascal_voc(object):
         :return:
         """
         images = np.zeros(
-            (size, self.image_size, self.image_size, 3))
-        labels = np.zeros(
-            (size, self.cell_size, self.cell_size, self.num_anchors, 5))
+            (size, self.image_size, self.image_size, 3), dtype=np.float32)
+        matching_true_boxes = np.zeros(
+            (size, self.cell_size, self.cell_size, self.num_anchors, 5), dtype=np.float32)
         response_anchors = np.zeros(
-            (size, self.cell_size, self.cell_size, self.num_anchors, 1))
-        imnames = []
+            (size, self.cell_size, self.cell_size, self.num_anchors, 1), dtype=np.float32)
+        gt_boxes = np.zeros(
+            (size, self.max_boxes_num, 5), dtype=np.float32)
         count = 0
         while count < size:
             imname = self.gt_labels[self.cursor]['imname']
-            imnames.append(imname)
             flipped = self.gt_labels[self.cursor]['flipped']
             images[count, :, :, :] = self.image_read(imname, flipped)  # 读取图片
-            labels[count, :, :, :, :] = self.gt_labels[self.cursor]['label']  # 图片的label
+            matching_true_boxes[count, :, :, :, :] = self.gt_labels[self.cursor]['label']  # 图片的label
             response_anchors[count, :, :, :, :] = self.gt_labels[self.cursor]['responseanchor']
+            gt_boxes[count, :, :] = self.gt_labels[self.cursor]['gtbox']
             count += 1
             self.cursor += 1
             if self.cursor >= len(self.gt_labels):
                 np.random.shuffle(self.gt_labels)  # 随机打乱gt_labels
                 self.cursor = 0
                 self.epoch += 1  # epoch加1
-        return imnames, images, labels, response_anchors  # 返回size大小的图片和对应的label，注意其shape
+        return images, matching_true_boxes, gt_boxes, response_anchors  # 返回size大小的图片和对应的label，注意其shape
 
     def image_read(self, imname, flipped=False):
         """
@@ -160,18 +162,34 @@ class pascal_voc(object):
 
         gt_labels = []
         print("number of gt labels is %d" % len(self.image_index))
+
+        self.max_boxes_num = 0
+
         for i, index in enumerate(self.image_index):
             print("parsing gt label, index:%d" % (i))  # 得到train或者test文件中所有指向图片的index,
-            label, reponse_anchor, num = self.load_pascal_annotation(
-                index)  # 读取annotation文件, return label and len(objs)
-            if num == 0:
+            label, gt_box, reponse_anchor, box_num = self.load_pascal_annotation(index)  # 读取annotation文件, return label and len(objs)
+            if box_num == 0:
                 continue
+
+            if(box_num > self.max_boxes_num):
+                self.max_boxes_num = box_num
+
             imname = os.path.join(self.data_path, 'JPEGImages',
                                   index + '.jpg')  # data/pascal_voc/VOCdevkit/VOC2007/JPEGImages/index.jpg
             gt_labels.append({'imname': imname,  # 图片的路径
                               'label': label,  # shape(cell_size, cell_size, 4+1)
+                              'gtbox': gt_box,
                               'responseanchor': reponse_anchor,
                               'flipped': False})
+
+        print("max boxes num in image:%d" % (self.max_boxes_num))
+
+        for idx, gt_label in enumerate(gt_labels):
+            box = gt_label["gtbox"]
+            box_ = np.zeros([self.max_boxes_num, 5], dtype=np.float32)
+            box_[:box.shape[0]] = box
+            gt_label["gtbox"] = box_
+
         print('Saving gt_labels to: ' + cache_file)
         with open(cache_file, 'wb') as f:  # 保存 label 到 cache file
             pickle.dump(gt_labels, f)
@@ -179,41 +197,52 @@ class pascal_voc(object):
 
     def load_pascal_annotation(self, index):
         """
-        从XML文件中加载 图片 以及 边界框坐标
+        从一个 XML 文件中加载 一张图片中所有 边界框 坐标
         :param index: 图片索引
         :return:
         """
-        imname = os.path.join(self.data_path, 'JPEGImages',
-                              index + '.jpg')  # data/pascal_voc/VOCdevkit/VOC2007/JPEGImages/index.jpg
-        im = cv2.imread(imname)
-        h_ratio = 1.0 * self.image_size / im.shape[0]  # 448所占图片高度的比例
-        w_ratio = 1.0 * self.image_size / im.shape[1]  # 448占图片宽度的比例
+        filename = os.path.join(self.data_path, 'Annotations', index + '.xml')  # data/pascal_voc/VOCdevkit/VOC2007/Annotations/index.xml
+        tree = ET.parse(filename)  # 解析xml文件
+
+        size_img = tree.find('size')
+        im_width = float(size_img.find('width').text)
+        im_height = float(size_img.find('height').text)
+
+        h_ratio = 1.0 * self.image_size / im_height  # 416所占图片高度的比例
+        w_ratio = 1.0 * self.image_size / im_width  # 416占图片宽度的比例
         # im = cv2.resize(im, [self.image_size, self.image_size])
         # shape (cell_size, cell_size, 1-confidence + 4-coordinate + 20-classs_one_hot)
-        label = np.zeros(
-            (self.cell_size, self.cell_size, self.num_anchors, 5))  # label数组维度 (image_size//32)*(image_size//32)*25
-        reponse_anchors = np.zeros((self.cell_size, self.cell_size, self.num_anchors, 1))
-        filename = os.path.join(self.data_path, 'Annotations',
-                                index + '.xml')  # data/pascal_voc/VOCdevkit/VOC2007/Annotations/index.xml
-        tree = ET.parse(filename)  # 解析xml文件
+        label = np.zeros((self.cell_size, self.cell_size, self.num_anchors, 5), dtype=np.float32)  # label数组维度 (image_size//32)*(image_size//32)*25
+        gt_box = []
+        reponse_anchors = np.zeros((self.cell_size, self.cell_size, self.num_anchors, 1), dtype=np.float32)
+
         objs = tree.findall('object')  # 找到index指向的该xml文件中的所有object
 
         for obj in objs:  # 解析xml文件中边界框的坐标
             bbox = obj.find('bndbox')
-            x1 = max(min((float(bbox.find('xmin').text) - 1) * w_ratio, self.image_size - 1),
-                     0) / self.image_scale  # 像素索引从零开始
-            y1 = max(min((float(bbox.find('ymin').text) - 1) * h_ratio, self.image_size - 1),
-                     0) / self.image_scale  # 范围[0, image_size]
-            x2 = max(min((float(bbox.find('xmax').text) - 1) * w_ratio, self.image_size - 1), 0) / self.image_scale
-            y2 = max(min((float(bbox.find('ymax').text) - 1) * h_ratio, self.image_size - 1), 0) / self.image_scale
+
+            x1 = max((float(bbox.find('xmin').text) - 1), 0)  # 像素索引从零开始
+            y1 = max((float(bbox.find('ymin').text) - 1), 0)  # 范围[0, 13]
+            x2 = max((float(bbox.find('xmax').text) - 1), 0)
+            y2 = max((float(bbox.find('ymax').text) - 1), 0)
+
             cls_ind = self.class_to_ind[obj.find('name').text.lower().strip()]  # 将类别转化为索引
+            # 原始图片尺寸下的坐标
             y_center = (y2 + y1) / 2.0
             x_center = (x2 + x1) / 2.0
             w = x2 - x1
             h = y2 - y1
-            y_ind = np.floor(y_center).astype('int')  # y_center落在哪个cell, cell的数量为13*13
-            x_ind = np.floor(x_center).astype('int')  # x_center落在哪个cell
-            box = np.array([y_center, x_center, h, w]) # 排列的方式为(y, x, h, w),loss函数中计算交并比时要注意
+
+            # 将坐标转换到新的尺寸，416*416
+            x_center_ = x_center * w_ratio / self.image_scale
+            y_center_ = y_center * h_ratio / self.image_scale
+            w_ = w * w_ratio / self.image_scale
+            h_ = h * h_ratio / self.image_scale
+
+            y_ind = np.floor(y_center_).astype('int')  # y_center落在哪个cell, cell的数量为13*13
+            x_ind = np.floor(x_center_).astype('int')  # x_center落在哪个cell
+            box_l = [x_center_, y_center_, w_, h_]                              # 排列的方式为(x, y, w, h),loss函数中计算交并比时要注意
+            box = np.array(box_l, dtype=np.float32)
             best_iou = 0.
             best_anchor = 0
 
@@ -236,11 +265,20 @@ class pascal_voc(object):
                     best_anchor = k
             if (best_iou > 0):
                 reponse_anchors[y_ind, x_ind, best_anchor] = 1
-                adjust_box = np.array([
-                    box[0] - y_ind, # y
-                    box[1] - x_ind, # x
-                    np.log(box[2] / self.anchors[best_anchor][0]),  # h
-                    np.log(box[3] / self.anchors[best_anchor][1]),  # w
-                    cls_ind], dtype=np.float32)
+                coord_param = [
+                    box[0] - x_ind, # x
+                    box[1] - y_ind, # y
+                    np.log(box[2] / self.anchors[best_anchor][0]),  # w
+                    np.log(box[3] / self.anchors[best_anchor][1]),  # h
+                    cls_ind]
+                adjust_box = np.array(coord_param, dtype=np.float32)
+                gt_box.append([
+                    x_center / im_width,
+                    y_center / im_height,
+                    w / im_width,
+                    h / im_height,
+                    cls_ind
+                ])
                 label[y_ind, x_ind, best_anchor] = adjust_box
-        return label, reponse_anchors, len(objs)
+        gt_box = np.array(gt_box, dtype=np.float32)
+        return label, gt_box, reponse_anchors, len(objs)
